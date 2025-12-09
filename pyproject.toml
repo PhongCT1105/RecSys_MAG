@@ -8,10 +8,13 @@ dependencies = [
     "adapters>=1.2.0",
     "ipykernel>=7.1.0",
     "ipython>=9.8.0",
+    "matplotlib>=3.10.7",
     "numpy>=2.3.5",
     "pandas>=2.3.3",
     "sentence-transformers>=5.1.2",
     "torch>=2.9.1",
     "torch-geometric>=2.7.0",
+    "torch-scatter>=2.1.2",
+    "torch-sparse>=0.6.18",
     "transformers>=4.51.3",
 ]

@@ -6,6 +6,7 @@ import torch
 from transformers import AutoTokenizer
 import numpy as np
 from torch_geometric.data import Data
+import torch_geometric.transforms as T
 
 JOURNAL_UNK = "<UNK_JOURNAL>"
 
@@ -111,7 +112,7 @@ def embedd_papers(df, batch_size=64):
 
 
 def get_mappings(df):
-    paper_ids = sorted(df["publication_ID"].unique())
+    paper_ids = sorted(df["publication_ID"].unique().astype("int"))
     paper_id2idx = {pid: i for i, pid in enumerate(paper_ids)}
     idx2paper_id = {i: pid for pid, i in paper_id2idx.items()}
 
@@ -121,22 +122,76 @@ def get_mappings(df):
     return paper_id2idx, idx2paper_id, journal2idx, idx2journal
 
 
-def build_edges_for_split(df_split, paper_id2idx):
-    paper_ids = sorted(df_split["publication_ID"].unique())
-    paper_set = set(paper_ids)
+def build_edges_for_split(df_split, paper_set, paper_id2idx):
     src_list, dst_list = [], []
     for _, row in df_split.iterrows():
         src_pid = int(row["publication_ID"])
         if src_pid not in paper_id2idx:
+            print(f"Warning: source paper ID {src_pid} not in mapping, skipping")
             continue
         src_idx = paper_id2idx[src_pid]
         for cited_pid in row["citation_list"]:
-            if cited_pid in paper_set:
+            if cited_pid in paper_set:  # else cited paper not in dataset
                 dst_idx = paper_id2idx[cited_pid]
                 src_list.append(src_idx)
                 dst_list.append(dst_idx)
+
     edge_index = torch.tensor([src_list, dst_list], dtype=torch.long)
     return edge_index
+
+
+def check_transductive_inductive(df):
+    """check if dataset is transductive or inductive by analyzing citation overlap"""
+    df_tr = df[df["split"] == "train"]
+    df_va = df[df["split"] == "val"]
+    df_te = df[df["split"] == "test"]
+
+    train_papers = set(df_tr["publication_ID"].astype("int"))
+    val_papers = set(df_va["publication_ID"].astype("int"))
+    test_papers = set(df_te["publication_ID"].astype("int"))
+
+    def get_citations(df_split):
+        citations = set()
+        for _, row in df_split.iterrows():
+            citations.update(row["citation_list"])
+        return citations
+
+    train_citations = get_citations(df_tr)
+    val_citations = get_citations(df_va)
+    test_citations = get_citations(df_te)
+
+    # check train -> val/test
+    train_cites_val = len(train_citations & val_papers)
+    train_cites_test = len(train_citations & test_papers)
+
+    # check val -> train/test
+    val_cites_train = len(val_citations & train_papers)
+    val_cites_test = len(val_citations & test_papers)
+
+    # check test -> train/val
+    test_cites_train = len(test_citations & train_papers)
+    test_cites_val = len(test_citations & val_papers)
+
+    print(f"\ntrain -> val citations: {train_cites_val}")
+    print(f"train -> test citations: {train_cites_test}")
+    print(f"val -> train citations: {val_cites_train}")
+    print(f"val -> test citations: {val_cites_test}")
+    print(f"test -> train citations: {test_cites_train}")
+    print(f"test -> val citations: {test_cites_val}")
+
+    is_transductive = (
+        train_cites_val > 0
+        or train_cites_test > 0
+        or val_cites_train > 0
+        or val_cites_test > 0
+        or test_cites_train > 0
+        or test_cites_val > 0
+    )
+
+    if is_transductive:
+        print("TRANSDUCTIVE!!! splits share citation edges")
+    else:
+        print("INDUCTIVE!!! splits have no citation overlap")
 
 
 def load_dataset(
@@ -149,6 +204,7 @@ def load_dataset(
     if preprocessed_path.exists() and not overwrite_preprocessed:
         print(f"Loading preprocessed dataframe from {preprocessed_path}")
         df = pd.read_pickle(preprocessed_path)
+        print(df["split"].value_counts())
         embeddings = np.load(embeddings_path)
         print(f"Loaded {len(df)} preprocessed papers")
     else:
@@ -161,31 +217,83 @@ def load_dataset(
         df_test["split"] = "test"
 
         df_raw = pd.concat([df_train, df_val, df_test], ignore_index=True)
+
         df = preprocess_papers(df_raw)
         df.to_pickle(preprocessed_path)
         embeddings = embedd_papers(df)
         np.save(embeddings_path, embeddings)
         print(f"Saved preprocessed df and embeddings")
 
-    paper_id2idx, idx2paper_id, journal2idx, idx2journal = get_mappings(df)
-    df_tr = df[df["split"] == "train"]
-    df_va = df[df["split"] == "val"]
-    df_te = df[df["split"] == "test"]
+    paper_ids = set(df["publication_ID"].astype(int))
+    # track which papers have in-network citations
+    papers_with_in_network_citations = set()
+    for _, row in df.iterrows():
+        source = int(row["publication_ID"])
+        if type(row["Citations"]) != str:
+            continue
 
-    edge_index_train = build_edges_for_split(df_tr, paper_id2idx)
-    edge_index_val = build_edges_for_split(df_va, paper_id2idx)
-    edge_index_test = build_edges_for_split(df_te, paper_id2idx)
+        citations = str(row["Citations"]).split(";")
+        for cite in citations:
+            try:
+                target = int(cite)
+                # only add edge if target is in our dataset
+                if target in paper_ids:
+                    papers_with_in_network_citations.add(source)
+                    papers_with_in_network_citations.add(target)
+            except ValueError:
+                continue
+    # keep only papers with in-network citations
+    # i.e., those that cite or are cited by another paper in the dataset
+    # check_transductive_inductive(df)
+    # get mappings for the full dataset
+
+    paper_id2idx, idx2paper_id, journal2idx, idx2journal = get_mappings(df)
+    # filter df to only include papers with in-network citations
+    df = df[df["publication_ID"].astype(int).isin(papers_with_in_network_citations)]
+    paper_set = set(df["publication_ID"].astype("int").tolist())
+    valid_paper_idx = [paper_id2idx[pid] for pid in paper_set]
+    embeddings = embeddings[valid_paper_idx, :].copy()  # filter embeddings to match df
+    # reset index
+    df = df.reset_index(drop=True)
+    # Sid is doing it this way because he already computed embeddings for all papers
+    # and now is filtering to only those with in-network citations
+    # so the indices still match up
+    paper_id2idx, idx2paper_id, journal2idx, idx2journal = get_mappings(
+        df
+    )  # remap indices after filtering
+    edge_index = build_edges_for_split(df, paper_set, paper_id2idx)
+    print(
+        "Edge index shapes:",
+        edge_index.shape,
+    )
     if include_journal_idx:
         journal_indices = [journal2idx[j] for j in df["cleaned_journal"].tolist()]
         x = np.hstack([np.array(embeddings), np.array(journal_indices).reshape(-1, 1)])
     else:
         x = np.array(embeddings)
     x_tensor = torch.tensor(x, dtype=torch.float32)
-    data = Data(x=x_tensor, edge_index=edge_index_train)
-    data.train_pos_edge_index = edge_index_train
-    data.val_pos_edge_index = edge_index_val
-    data.test_pos_edge_index = edge_index_test
-    return data, paper_id2idx, idx2paper_id, journal2idx, idx2journal
+    x_tensor = torch.zeros_like(x_tensor)  # Sid is doing random features for now
+    data = Data(x=x_tensor, edge_index=edge_index)
+    data.validate(True)
+    transform = T.RandomLinkSplit(
+        num_val=0.2,
+        num_test=0.2,
+        disjoint_train_ratio=0.3,  # TODO check!
+        neg_sampling_ratio=0,
+        add_negative_train_samples=False,
+        edge_types=("user", "rates", "movie"),
+        rev_edge_types=("movie", "rev_rates", "user"),
+    )
+    train_data, val_data, test_data = transform(data)
+    return (
+        train_data,
+        val_data,
+        test_data,
+        paper_id2idx,
+        idx2paper_id,
+        journal2idx,
+        idx2journal,
+    )
 
 
 if __name__ == "__main__":
@@ -197,6 +305,7 @@ if __name__ == "__main__":
     df_test["split"] = "test"
 
     df_raw = pd.concat([df_train, df_val, df_test], ignore_index=True)
+
     df = preprocess_papers(df_raw)
     embeddings = embedd_papers(df, batch_size=256)
     df.to_pickle(ROOT / "preprocessed_df.pkl")

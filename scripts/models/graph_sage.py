@@ -38,7 +38,6 @@ class GraphSAGE(nn.Module):
             nn.Linear(2 * out_channels, out_channels),
             nn.ReLU(),
             nn.Linear(out_channels, 1),
-            nn.Sigmoid(),
         )
 
         # Output layer
@@ -88,8 +87,7 @@ def train_epoch(model, loader, optimizer, device, criterion=None):
         batch = batch.to(device)
         optimizer.zero_grad()
         # encode
-        test = torch.rand_like(batch.x)
-        z = model.encode(test, batch.edge_index)
+        z = model.encode(batch.x, batch.edge_index)
 
         # decode link predictions
         pred = model.decode(z, batch.edge_label_index)
@@ -117,9 +115,8 @@ def evaluate_loader(model, loader, device):
 
     for batch in loader:
         batch = batch.to(device)
-        test = torch.rand_like(batch.x)
         # encode
-        z = model.encode(test, batch.edge_index)
+        z = model.encode(batch.x, batch.edge_index)
 
         # decode
         pred = model.decode(z, batch.edge_label_index).sigmoid()
@@ -134,40 +131,72 @@ def evaluate_loader(model, loader, device):
 
 
 @torch.no_grad()
-def evaluate_full(model, data, edge_index, device):
-    """evaluate on full graph without batching"""
-    from sklearn.metrics import roc_auc_score
+def evaluate_ranking_metrics(model, loader, device, k_values=[1, 5]):
+    """evaluate precision@k and mrr for link prediction"""
+    import numpy as np
 
     model.eval()
 
-    # encode all nodes
-    z = model.encode(data.x, data.edge_index)
+    all_source_nodes = []
+    all_target_nodes = []
+    all_scores = []
+    all_labels = []
 
-    # positive edges
-    pos_pred = model.decode(z, edge_index).sigmoid()
+    # collect all predictions
+    for batch in loader:
+        batch = batch.to(device)
+        z = model.encode(batch.x, batch.edge_index)
+        scores = model.decode(z, batch.edge_label_index).sigmoid()
 
-    # negative sampling
-    neg_edge_index = negative_sampling(
-        edge_index=data.edge_index,
-        num_nodes=data.num_nodes,
-        num_neg_samples=edge_index.size(1),
-        exclude_edges=[
-            data.train_pos_edge_index,
-            data.val_pos_edge_index,
-            data.test_pos_edge_index,
-        ],
-    )
-    neg_pred = model.decode(z, neg_edge_index).sigmoid()
+        all_source_nodes.append(batch.edge_label_index[0].cpu())
+        all_target_nodes.append(batch.edge_label_index[1].cpu())
+        all_scores.append(scores.cpu())
+        all_labels.append(batch.edge_label.cpu())
 
-    # combine predictions and labels
-    pred = torch.cat([pos_pred, neg_pred]).cpu().numpy()
-    labels = (
-        torch.cat([torch.ones(pos_pred.size(0)), torch.zeros(neg_pred.size(0))])
-        .cpu()
-        .numpy()
-    )
+    source_nodes = torch.cat(all_source_nodes)
+    target_nodes = torch.cat(all_target_nodes)
+    scores = torch.cat(all_scores)
+    labels = torch.cat(all_labels)
 
-    return roc_auc_score(labels, pred)
+    # group by source node
+    unique_sources = source_nodes.unique()
+
+    precision_at_k = {k: [] for k in k_values}
+    reciprocal_ranks = []
+
+    for src in unique_sources:
+        mask = source_nodes == src
+        src_targets = target_nodes[mask]
+        src_scores = scores[mask]
+        src_labels = labels[mask]
+
+        # sort by score descending
+        sorted_indices = torch.argsort(src_scores, descending=True)
+        sorted_labels = src_labels[sorted_indices]
+
+        # precision@k
+        for k in k_values:
+            print("here", len(sorted_labels))
+            if len(sorted_labels) >= k:
+                precision_at_k[k].append(sorted_labels[:k].sum().item() / k)
+
+        # mrr: find rank of first positive
+        positive_indices = (sorted_labels == 1).nonzero(as_tuple=True)[0]
+        if len(positive_indices) > 0:
+            first_positive_rank = positive_indices[0].item() + 1
+            reciprocal_ranks.append(1.0 / first_positive_rank)
+
+    # compute averages
+    metrics = {}
+    for k in k_values:
+        if precision_at_k[k]:
+            metrics[f"precision@{k}"] = np.mean(precision_at_k[k])
+        else:
+            metrics[f"precision@{k}"] = 0.0
+
+    metrics["mrr"] = np.mean(reciprocal_ranks) if reciprocal_ranks else 0.0
+
+    return metrics
 
 
 def train_step(model, data, optimizer, criterion=None):
@@ -212,46 +241,6 @@ def train_step(model, data, optimizer, criterion=None):
     optimizer.step()
 
     return loss.item()
-
-
-@torch.no_grad()
-def evaluate(model, data, edge_index):
-    """
-    Evaluate model on given edges.
-
-    Args:
-        model: GraphSAGE model
-        data: PyG Data object
-        edge_index: Edge indices to evaluate
-
-    Returns:
-        AUC score
-    """
-    from sklearn.metrics import roc_auc_score
-
-    model.eval()
-
-    z = model.encode(data.x, edge_index)
-    # Positive edges
-    pos_pred = model.decode(z, edge_index)
-
-    # Negative sampling - exclude all known edges
-    neg_edge_index = negative_sampling(
-        edge_index=data.edge_index,
-        num_nodes=data.num_nodes,
-        num_neg_samples=edge_index.size(1),
-    )
-    neg_pred = model.decode(z, neg_edge_index)
-
-    # Combine predictions and labels
-    pred = torch.cat([pos_pred, neg_pred]).cpu().numpy()
-    labels = (
-        torch.cat([torch.ones(pos_pred.size(0)), torch.zeros(neg_pred.size(0))])
-        .cpu()
-        .numpy()
-    )
-
-    return roc_auc_score(labels, pred)
 
 
 if __name__ == "__main__":

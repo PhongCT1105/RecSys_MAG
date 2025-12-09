@@ -4,13 +4,16 @@ import pandas as pd
 from adapters import AutoAdapterModel
 import torch
 from transformers import AutoTokenizer
+import torch_geometric.transforms as T
 import numpy as np
 from torch_geometric.data import Data
-import torch_geometric.transforms as T
+import pickle
+from tqdm import tqdm
 
 JOURNAL_UNK = "<UNK_JOURNAL>"
+AUTHOR_UNK = "<UNK_AUTHOR>"
 
-ROOT = Path("..").resolve()  # your notebook folder
+ROOT = Path("..").resolve()
 PATH_TRAIN = ROOT / "dataset" / "train.txt"
 PATH_VAL = ROOT / "dataset" / "val.txt"
 PATH_TEST = ROOT / "dataset" / "test.txt"
@@ -35,26 +38,30 @@ def load_split_whole_file(path: Path) -> pd.DataFrame:
     return df
 
 
+def parse_citations(cstr):
+    if not isinstance(cstr, str):
+        return []
+    out = []
+    for c in cstr.split(";"):
+        c = c.strip()
+        if c.isdigit():
+            out.append(int(c))
+    return out
+
+
 def preprocess_papers(df: pd.DataFrame, min_journal_freq=5):
     df = df.copy()
+    # remove duplicate publication_IDs
+    df = df.drop_duplicates(subset=["publication_ID"])
 
     df = df[df["title"].notna() & df["abstract"].notna()]
     df = df[df["abstract"].str.len() > 20]
-
-    def parse_citations(cstr):
-        if not isinstance(cstr, str):
-            return []
-        out = []
-        for c in cstr.split(";"):
-            c = c.strip()
-            if c.isdigit():
-                out.append(int(c))
-        return out
+    df = df.reset_index(drop=True)
 
     df["citation_list"] = df["Citations"].apply(parse_citations)
     df["citation_count"] = df["citation_list"].str.len()
 
-    df = df[df["citation_count"] > 0]
+    df = df[df["citation_count"] > 0]  # atleast has cited one paper
     df["publication_ID"] = df["publication_ID"].astype(int)
 
     journal_counts = df["journal"].value_counts()
@@ -69,11 +76,179 @@ def preprocess_papers(df: pd.DataFrame, min_journal_freq=5):
     return df
 
 
-def embedd_papers(df, batch_size=64):
+def make_mappings(df, min_author_papers=2):
+    """create mappings for heterogeneous graph:
+    1. paper -> cited papers (paper_cites_paper)
+    2. paper -> journal (paper_belongs_to_journal)
+    3. paper -> authors (paper_written_by_author)
+    4. author -> author (author_coauthor_author)
+    """
+
+    # 1. paper to index mapping
+    paper_ids = sorted(df["publication_ID"].unique())
+    paper_id2idx = {pid: i for i, pid in enumerate(paper_ids)}
+    idx2paper_id = {i: pid for pid, i in paper_id2idx.items()}
+
+    # 2. journal to index mapping
+    unique_journals = sorted(df["cleaned_journal"].unique())
+    journal2idx = {j: i for i, j in enumerate(unique_journals)}
+    idx2journal = {i: j for j, i in journal2idx.items()}
+
+    # 3. count author paper frequency and replace rare authors with AUTHOR_UNK
+    author_paper_count = {}
+    for authors_list in df["authors"]:
+        if isinstance(authors_list, list):
+            for author in authors_list:
+                if isinstance(author, dict) and "id" in author:
+                    author_id = author["id"]
+                    author_paper_count[author_id] = (
+                        author_paper_count.get(author_id, 0) + 1
+                    )
+
+    # print distribution
+    paper_counts = list(author_paper_count.values())
+    print(f"\n=== author distribution ===")
+    print(f"total unique authors: {len(author_paper_count)}")
+    print(f"min papers per author: {min(paper_counts)}")
+    print(f"max papers per author: {max(paper_counts)}")
+    print(f"mean papers per author: {np.mean(paper_counts):.2f}")
+    print(f"median papers per author: {np.median(paper_counts):.0f}")
+
+    # count authors below threshold
+    rare_authors = sum(1 for count in paper_counts if count < min_author_papers)
+    print(
+        f"authors with < {min_author_papers} papers: {rare_authors} ({rare_authors/len(author_paper_count)*100:.1f}%)"
+    )
+
+    # create cleaned author ids (replace rare authors with AUTHOR_UNK)
+    cleaned_author_ids = {}
+    for author_id, count in author_paper_count.items():
+        if count >= min_author_papers:
+            cleaned_author_ids[author_id] = author_id
+        else:
+            cleaned_author_ids[author_id] = AUTHOR_UNK
+
+    # author to index mapping (including AUTHOR_UNK)
+    unique_author_ids = sorted(set(cleaned_author_ids.values()))
+    author_id2idx = {aid: i for i, aid in enumerate(unique_author_ids)}
+    idx2author_id = {i: aid for aid, i in author_id2idx.items()}
+
+    # 4. create edge indices
+    # paper cites paper
+    paper_cites_paper_src = []
+    paper_cites_paper_dst = []
+
+    for _, row in df.iterrows():
+        src_pid = int(row["publication_ID"])
+        src_idx = paper_id2idx[src_pid]
+
+        for cited_pid in row["citation_list"]:
+            if cited_pid in paper_id2idx:
+                dst_idx = paper_id2idx[cited_pid]
+                paper_cites_paper_src.append(src_idx)
+                paper_cites_paper_dst.append(dst_idx)
+
+    # paper belongs to journal
+    paper_journal_src = []
+    paper_journal_dst = []
+
+    for _, row in df.iterrows():
+        paper_idx = paper_id2idx[int(row["publication_ID"])]
+        journal_idx = journal2idx[row["cleaned_journal"]]
+        paper_journal_src.append(paper_idx)
+        paper_journal_dst.append(journal_idx)
+
+    # paper written by author (using cleaned author ids)
+    paper_author_src = []
+    paper_author_dst = []
+
+    for _, row in df.iterrows():
+        paper_idx = paper_id2idx[int(row["publication_ID"])]
+
+        if isinstance(row["authors"], list):
+            for author in row["authors"]:
+                if isinstance(author, dict) and "id" in author:
+                    author_id = author["id"]
+                    # use cleaned author id (may be AUTHOR_UNK)
+                    cleaned_author_id = cleaned_author_ids.get(author_id, AUTHOR_UNK)
+                    if cleaned_author_id in author_id2idx:
+                        author_idx = author_id2idx[cleaned_author_id]
+                        paper_author_src.append(paper_idx)
+                        paper_author_dst.append(author_idx)
+    paper_author_src = []
+    paper_author_dst = []
+
+    for _, row in df.iterrows():
+        paper_idx = paper_id2idx[int(row["publication_ID"])]
+
+        if isinstance(row["authors"], list):
+            for author in row["authors"]:
+                if isinstance(author, dict) and "id" in author:
+                    author_id = author["id"]
+                    if author_id in author_id2idx:
+                        author_idx = author_id2idx[author_id]
+                        paper_author_src.append(paper_idx)
+                        paper_author_dst.append(author_idx)
+
+    # author coauthor author (undirected - store only one direction, using cleaned ids)
+    author_coauthor_edges = set()
+
+    for _, row in df.iterrows():
+        if isinstance(row["authors"], list):
+            author_indices = []
+            for author in row["authors"]:
+                if isinstance(author, dict) and "id" in author:
+                    author_id = author["id"]
+                    # use cleaned author id
+                    cleaned_author_id = cleaned_author_ids.get(author_id, AUTHOR_UNK)
+                    if cleaned_author_id in author_id2idx:
+                        author_indices.append(author_id2idx[cleaned_author_id])
+
+            # create edges between all pairs of coauthors (only one direction)
+            for i in range(len(author_indices)):
+                for j in range(i + 1, len(author_indices)):
+                    # store as (min, max) to ensure single direction
+                    a1, a2 = author_indices[i], author_indices[j]
+                    author_coauthor_edges.add((min(a1, a2), max(a1, a2)))
+
+    # convert set to lists
+    author_coauthor_src = [edge[0] for edge in author_coauthor_edges]
+    author_coauthor_dst = [edge[1] for edge in author_coauthor_edges]
+
+    mappings = {
+        "paper_id2idx": paper_id2idx,
+        "idx2paper_id": idx2paper_id,
+        "journal2idx": journal2idx,
+        "idx2journal": idx2journal,
+        "author_id2idx": author_id2idx,
+        "idx2author_id": idx2author_id,
+        "edges": {
+            "paper_cites_paper": np.array(
+                [paper_cites_paper_src, paper_cites_paper_dst]
+            ),
+            "paper_belongs_to_journal": np.array(
+                [paper_journal_src, paper_journal_dst]
+            ),
+            "paper_written_by_author": np.array([paper_author_src, paper_author_dst]),
+            "author_coauthor_author": np.array(
+                [author_coauthor_src, author_coauthor_dst]
+            ),
+        },
+        "num_papers": len(paper_ids),
+        "num_journals": len(unique_journals),
+        "num_authors": len(cleaned_author_ids),
+    }
+
+    return mappings
+
+
+def embedd_papers(df, batch_size=256):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = AutoAdapterModel.from_pretrained("allenai/specter2_base")
     # load proximity adapter
-    model.load_adapter("allenai/specter2", source="hf", set_active=True)
+    model.load_adapter(
+        "allenai/specter2", load_as="proximity", source="hf", set_active=True
+    )
     model = model.to(device)
     tokenizer = AutoTokenizer.from_pretrained("allenai/specter2_base")
 
@@ -83,7 +258,7 @@ def embedd_papers(df, batch_size=64):
     all_embeddings = []
 
     # Process in batches
-    for i in range(0, len(text_batch), batch_size):
+    for i in tqdm(range(0, len(text_batch), batch_size), desc="Embedding papers"):
         batch_texts = text_batch[i : i + batch_size]
 
         # preprocess the input
@@ -111,202 +286,87 @@ def embedd_papers(df, batch_size=64):
     return embeddings
 
 
-def get_mappings(df):
-    paper_ids = sorted(df["publication_ID"].unique().astype("int"))
-    paper_id2idx = {pid: i for i, pid in enumerate(paper_ids)}
-    idx2paper_id = {i: pid for pid, i in paper_id2idx.items()}
-
-    unique_journals = sorted(df["cleaned_journal"].unique())
-    journal2idx = {val: idx for idx, val in enumerate(unique_journals)}
-    idx2journal = {idx: val for val, idx in journal2idx.items()}
-    return paper_id2idx, idx2paper_id, journal2idx, idx2journal
-
-
-def build_edges_for_split(df_split, paper_set, paper_id2idx):
-    src_list, dst_list = [], []
-    for _, row in df_split.iterrows():
-        src_pid = int(row["publication_ID"])
-        if src_pid not in paper_id2idx:
-            print(f"Warning: source paper ID {src_pid} not in mapping, skipping")
-            continue
-        src_idx = paper_id2idx[src_pid]
-        for cited_pid in row["citation_list"]:
-            if cited_pid in paper_set:  # else cited paper not in dataset
-                dst_idx = paper_id2idx[cited_pid]
-                src_list.append(src_idx)
-                dst_list.append(dst_idx)
-
-    edge_index = torch.tensor([src_list, dst_list], dtype=torch.long)
-    return edge_index
-
-
-def check_transductive_inductive(df):
-    """check if dataset is transductive or inductive by analyzing citation overlap"""
-    df_tr = df[df["split"] == "train"]
-    df_va = df[df["split"] == "val"]
-    df_te = df[df["split"] == "test"]
-
-    train_papers = set(df_tr["publication_ID"].astype("int"))
-    val_papers = set(df_va["publication_ID"].astype("int"))
-    test_papers = set(df_te["publication_ID"].astype("int"))
-
-    def get_citations(df_split):
-        citations = set()
-        for _, row in df_split.iterrows():
-            citations.update(row["citation_list"])
-        return citations
-
-    train_citations = get_citations(df_tr)
-    val_citations = get_citations(df_va)
-    test_citations = get_citations(df_te)
-
-    # check train -> val/test
-    train_cites_val = len(train_citations & val_papers)
-    train_cites_test = len(train_citations & test_papers)
-
-    # check val -> train/test
-    val_cites_train = len(val_citations & train_papers)
-    val_cites_test = len(val_citations & test_papers)
-
-    # check test -> train/val
-    test_cites_train = len(test_citations & train_papers)
-    test_cites_val = len(test_citations & val_papers)
-
-    print(f"\ntrain -> val citations: {train_cites_val}")
-    print(f"train -> test citations: {train_cites_test}")
-    print(f"val -> train citations: {val_cites_train}")
-    print(f"val -> test citations: {val_cites_test}")
-    print(f"test -> train citations: {test_cites_train}")
-    print(f"test -> val citations: {test_cites_val}")
-
-    is_transductive = (
-        train_cites_val > 0
-        or train_cites_test > 0
-        or val_cites_train > 0
-        or val_cites_test > 0
-        or test_cites_train > 0
-        or test_cites_val > 0
-    )
-
-    if is_transductive:
-        print("TRANSDUCTIVE!!! splits share citation edges")
-    else:
-        print("INDUCTIVE!!! splits have no citation overlap")
-
-
-def load_dataset(
-    overwrite_preprocessed=False,
-    include_journal_idx=True,
-    preprocessed_path=ROOT / "preprocessed_df.pkl",
-    embeddings_path=ROOT / "embeddings.npy",
-):
-
-    if preprocessed_path.exists() and not overwrite_preprocessed:
-        print(f"Loading preprocessed dataframe from {preprocessed_path}")
-        df = pd.read_pickle(preprocessed_path)
-        print(df["split"].value_counts())
-        embeddings = np.load(embeddings_path)
-        print(f"Loaded {len(df)} preprocessed papers")
-    else:
-        print("No preprocessed dataframe found, processing from scratch...")
-        df_train = load_split_whole_file(PATH_TRAIN)
-        df_val = load_split_whole_file(PATH_VAL)
-        df_test = load_split_whole_file(PATH_TEST)
-        df_train["split"] = "train"
-        df_val["split"] = "val"
-        df_test["split"] = "test"
-
-        df_raw = pd.concat([df_train, df_val, df_test], ignore_index=True)
-
-        df = preprocess_papers(df_raw)
-        df.to_pickle(preprocessed_path)
-        embeddings = embedd_papers(df)
-        np.save(embeddings_path, embeddings)
-        print(f"Saved preprocessed df and embeddings")
-
-    paper_ids = set(df["publication_ID"].astype(int))
-    # track which papers have in-network citations
-    papers_with_in_network_citations = set()
-    for _, row in df.iterrows():
-        source = int(row["publication_ID"])
-        if type(row["Citations"]) != str:
-            continue
-
-        citations = str(row["Citations"]).split(";")
-        for cite in citations:
-            try:
-                target = int(cite)
-                # only add edge if target is in our dataset
-                if target in paper_ids:
-                    papers_with_in_network_citations.add(source)
-                    papers_with_in_network_citations.add(target)
-            except ValueError:
-                continue
-    # keep only papers with in-network citations
-    # i.e., those that cite or are cited by another paper in the dataset
-    # check_transductive_inductive(df)
-    # get mappings for the full dataset
-
-    paper_id2idx, idx2paper_id, journal2idx, idx2journal = get_mappings(df)
-    # filter df to only include papers with in-network citations
-    df = df[df["publication_ID"].astype(int).isin(papers_with_in_network_citations)]
-    paper_set = set(df["publication_ID"].astype("int").tolist())
-    valid_paper_idx = [paper_id2idx[pid] for pid in paper_set]
-    embeddings = embeddings[valid_paper_idx, :].copy()  # filter embeddings to match df
-    # reset index
-    df = df.reset_index(drop=True)
-    # Sid is doing it this way because he already computed embeddings for all papers
-    # and now is filtering to only those with in-network citations
-    # so the indices still match up
-    paper_id2idx, idx2paper_id, journal2idx, idx2journal = get_mappings(
-        df
-    )  # remap indices after filtering
-    edge_index = build_edges_for_split(df, paper_set, paper_id2idx)
-    print(
-        "Edge index shapes:",
-        edge_index.shape,
+def get_homogeneous_data(include_journal_idx=False):
+    mappings = load_processed_data()
+    num_papers = mappings["num_papers"]
+    x_tensor = torch.tensor(
+        mappings["paper_embeddings"], dtype=torch.float, requires_grad=False
     )
     if include_journal_idx:
-        journal_indices = [journal2idx[j] for j in df["cleaned_journal"].tolist()]
-        x = np.hstack([np.array(embeddings), np.array(journal_indices).reshape(-1, 1)])
-    else:
-        x = np.array(embeddings)
-    x_tensor = torch.tensor(x, dtype=torch.float32)
-    x_tensor = torch.zeros_like(x_tensor)  # Sid is doing random features for now
-    data = Data(x=x_tensor, edge_index=edge_index)
-    data.validate(True)
+        journal_idx_tensor = torch.tensor(
+            [
+                mappings["journal2idx"].get(j, mappings["journal2idx"][JOURNAL_UNK])
+                for j in mappings["df"]["cleaned_journal"]
+            ],
+            dtype=torch.long,
+        )
+        x_tensor = torch.cat(
+            [x_tensor, journal_idx_tensor.unsqueeze(1).float()],
+            dim=1,
+            requires_grad=False,
+        )
+    data = Data(x=x_tensor)
+    data.edge_index = torch.tensor(
+        mappings["edges"]["paper_cites_paper"], dtype=torch.long
+    )
+    data.num_nodes = num_papers
+    data.validate(raise_on_error=True)
     transform = T.RandomLinkSplit(
         num_val=0.2,
         num_test=0.2,
-        disjoint_train_ratio=0.3,  # TODO check!
-        neg_sampling_ratio=0,
+        disjoint_train_ratio=0.3,
+        neg_sampling_ratio=2,
         add_negative_train_samples=False,
-        edge_types=("user", "rates", "movie"),
-        rev_edge_types=("movie", "rev_rates", "user"),
     )
     train_data, val_data, test_data = transform(data)
-    return (
-        train_data,
-        val_data,
-        test_data,
-        paper_id2idx,
-        idx2paper_id,
-        journal2idx,
-        idx2journal,
-    )
+    return train_data, val_data, test_data, data, mappings
+
+
+def load_processed_data():
+    pickle_path = ROOT / "dataset" / "processed_data_rnd.pkl"
+    if not pickle_path.exists():
+        raise FileNotFoundError(
+            f"Processed data not found at {pickle_path}. Run load_data.py first or download from G-Drive."
+        )
+    with pickle_path.open("rb") as f:
+        data = pickle.load(f)
+    return data
 
 
 if __name__ == "__main__":
     df_train = load_split_whole_file(PATH_TRAIN)
     df_val = load_split_whole_file(PATH_VAL)
     df_test = load_split_whole_file(PATH_TEST)
-    df_train["split"] = "train"
-    df_val["split"] = "val"
-    df_test["split"] = "test"
 
-    df_raw = pd.concat([df_train, df_val, df_test], ignore_index=True)
+    df_all = pd.concat([df_train, df_val, df_test]).reset_index(drop=True)
+    print(f"Total papers before preprocessing: {len(df_all)}")
+    # print(df_all.columns)
+    # Index(['publication_ID', 'Citations', 'pubDate', 'language', 'title',
+    #    'journal', 'abstract', 'keywords', 'authors', 'venue', 'doi'],
+    #   dtype='object')
 
-    df = preprocess_papers(df_raw)
-    embeddings = embedd_papers(df, batch_size=256)
-    df.to_pickle(ROOT / "preprocessed_df.pkl")
-    np.save(ROOT / "embeddings.npy", embeddings)
+    # preprocess the dataset
+    df_all = preprocess_papers(df_all, min_journal_freq=2)
+    print(f"Total papers after preprocessing: {len(df_all)}")
+
+    # create mappings
+    mappings = make_mappings(df_all)
+
+    print(f"\n=== mapping statistics ===")
+    print(f"num papers: {mappings['num_papers']}")
+    print(f"num journals: {mappings['num_journals']}")
+    print(f"num authors: {mappings['num_authors']}")
+
+    print(f"\n=== edge statistics ===")
+    for edge_type, edge_index in mappings["edges"].items():
+        print(f"{edge_type}: {edge_index.shape}")
+
+    # verify
+    assert len(df_all) == 56416
+    mappings["df"] = df_all
+    embeddings = embedd_papers(df_all, batch_size=64)
+    mappings["paper_embeddings"] = embeddings
+    pickle_path = ROOT / "dataset" / "processed_data.pkl"
+    with pickle_path.open("wb") as f:
+        pickle.dump(mappings, f)
+    print(f"\nSaved processed data to {pickle_path}")

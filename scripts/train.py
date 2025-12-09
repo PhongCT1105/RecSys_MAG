@@ -2,13 +2,19 @@ import argparse
 import torch
 import torch.nn as nn
 from pathlib import Path
+from torch_geometric.data import Data
 import sys
 from torch_geometric.loader import LinkNeighborLoader
 import torch_geometric.transforms as T
 
 sys.path.append(str(Path(__file__).parent))
-from load_data import load_dataset
-from models.graph_sage import GraphSAGE, train_epoch, evaluate_loader
+from load_data import load_processed_data, get_homogeneous_data
+from models.graph_sage import (
+    GraphSAGE,
+    train_epoch,
+    evaluate_loader,
+    evaluate_ranking_metrics,
+)
 
 
 def parse_args():
@@ -53,35 +59,36 @@ def set_seed(seed):
     torch.cuda.manual_seed_all(seed)
 
 
-def get_loaders(train_data, val_data, test_data):
+def get_loaders(train_data, val_data, test_data, batch_size=128):
     """create link prediction loaders with neighbor sampling"""
     num_neighbors = [10, 5]  # two layers, 10 neighbors each
     train_loader = LinkNeighborLoader(
         train_data,
-        num_neighbors=num_neighbors,
-        edge_label_index=train_data.edge_label_index,  # edges to predict
-        batch_size=1000,
+        num_neighbors=[20, 10, 10],  # three layers, more neighbors for training
+        edge_label=train_data.edge_label,  # edges to predict
+        edge_label_index=train_data.edge_label_index,
+        batch_size=batch_size,
         shuffle=True,
-        neg_sampling="binary",  # 1 negative per positive
-        num_workers=0,
+        neg_sampling_ratio=2.0,  # 2 negatives per positive
+        num_workers=1,
     )
 
     val_loader = LinkNeighborLoader(
-        val_data,
-        num_neighbors=num_neighbors,
+        data=val_data,
+        num_neighbors=[20, 10, 10],
         edge_label_index=val_data.edge_label_index,
-        batch_size=500,
+        edge_label=val_data.edge_label,
+        batch_size=3 * batch_size,
         shuffle=False,
-        neg_sampling="binary",
     )
 
     test_loader = LinkNeighborLoader(
-        test_data,
-        num_neighbors=num_neighbors,
+        data=test_data,
+        num_neighbors=[20, 10, 10],
         edge_label_index=test_data.edge_label_index,
-        batch_size=500,
+        edge_label=test_data.edge_label,
+        batch_size=3 * batch_size,
         shuffle=False,
-        neg_sampling="binary",
     )
 
     return train_loader, val_loader, test_loader
@@ -95,23 +102,20 @@ def main():
     print(f"using device: {device}")
 
     print("loading dataset...")
-    (
-        train_data,
-        val_data,
-        test_data,
-        paper_id2idx,
-        idx2paper_id,
-        journal2idx,
-        idx2journal,
-    ) = load_dataset(include_journal_idx=args.include_journal)
+    train_data, val_data, test_data, data, mappings = get_homogeneous_data(
+        include_journal_idx=args.include_journal
+    )
+    train_data: Data = train_data
+
     # data = data.to(device)
-    print(train_data)
-    print(val_data)
-    train_loader, val_loader, test_loader = get_loaders(train_data, val_data, test_data)
+
+    train_loader, val_loader, test_loader = get_loaders(
+        train_data, val_data, test_data, batch_size=256
+    )  # note it will be 3*batch_size due to 2:1 negative sampling ratio
 
     if args.model == "sage":
         model = GraphSAGE(
-            in_channels=train_data.num_features,
+            in_channels=data.num_features,
             hidden_channels=args.hidden_dim,
             out_channels=args.out_dim,
             num_layers=args.num_layers,
@@ -133,7 +137,14 @@ def main():
     best_val_auc = 0
     best_epoch = 0
 
+    train_auc = evaluate_loader(model, train_loader, device)
+    val_auc = evaluate_loader(model, val_loader, device)
+    test_auc = evaluate_loader(model, test_loader, device)
+    print(f"initial train auc: {train_auc:.4f}")
+    print(f"initial val auc: {val_auc:.4f}")
+    print(f"initial test auc: {test_auc:.4f}")
     print(f"\ntraining for {args.epochs} epochs...")
+
     for epoch in range(1, args.epochs + 1):
         loss = train_epoch(model, train_loader, optimizer, device)
 
@@ -141,8 +152,19 @@ def main():
             train_auc = evaluate_loader(model, train_loader, device)
             val_auc = evaluate_loader(model, val_loader, device)
 
+            # compute ranking metrics on validation set
+            val_ranking = evaluate_ranking_metrics(
+                model, val_loader, device, k_values=[1, 5, 10, 20]
+            )
+
             print(
                 f"epoch {epoch:03d} | loss: {loss:.4f} | train auc: {train_auc:.4f} | val auc: {val_auc:.4f}"
+            )
+            print(
+                f"  val p@1: {val_ranking['precision@1']:.4f} | "
+                f"p@5: {val_ranking['precision@5']:.4f} | "
+                f"p@10: {val_ranking['precision@10']:.4f} | "
+                f"mrr: {val_ranking['mrr']:.4f}"
             )
 
             if val_auc > best_val_auc:
@@ -164,10 +186,16 @@ def main():
                     )
 
     test_auc = evaluate_loader(model, test_loader, device)
+    test_ranking = evaluate_ranking_metrics(model, test_loader, device, k_values=[1, 5])
 
     print(f"\ntraining complete!")
     print(f"best val auc: {best_val_auc:.4f} at epoch {best_epoch}")
-    print(f"test auc: {test_auc:.4f}")
+    print(f"\ntest results:")
+    print(f"  auc: {test_auc:.4f}")
+    print(f"  precision@1: {test_ranking['precision@1']:.4f}")
+    print(f"  precision@5: {test_ranking['precision@5']:.4f}")
+
+    print(f"  mrr: {test_ranking['mrr']:.4f}")
 
     if args.save_model:
         print(f"model saved to {args.model_path}")

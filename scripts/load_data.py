@@ -6,9 +6,10 @@ import torch
 from transformers import AutoTokenizer
 import torch_geometric.transforms as T
 import numpy as np
-from torch_geometric.data import Data
+from torch_geometric.data import Data, HeteroData
 import pickle
 from tqdm import tqdm
+import random
 
 JOURNAL_UNK = "<UNK_JOURNAL>"
 AUTHOR_UNK = "<UNK_AUTHOR>"
@@ -286,9 +287,112 @@ def embedd_papers(df, batch_size=256):
     return embeddings
 
 
-def get_homogeneous_data(include_journal_idx=False):
+def get_hetrogeneous_data(seed=42):
     mappings = load_processed_data()
     num_papers = mappings["num_papers"]
+    journals = mappings["df"]["cleaned_journal"].tolist()
+    authors = mappings["df"]["authors"].tolist()
+    x_tensor = torch.tensor(
+        mappings["paper_embeddings"], dtype=torch.float, requires_grad=False
+    )
+    data = HeteroData()
+    data["paper"].x = x_tensor
+
+    data["journal"].node_id = torch.tensor(
+        [mappings["journal2idx"][j] for j in journals], dtype=torch.long
+    )
+    data["author"].node_id = torch.tensor(
+        [
+            mappings["author_id2idx"].get(
+                author["id"], mappings["author_id2idx"][AUTHOR_UNK]
+            )
+            for authors_list in authors
+            for author in authors_list
+            if isinstance(author, dict) and "id" in author
+        ],
+        dtype=torch.long,
+    )
+    # ['paper_cites_paper', 'paper_belongs_to_journal',
+    #  'paper_written_by_author', 'author_coauthor_author']
+    data["paper", "cites", "paper"].edge_index = torch.tensor(
+        mappings["edges"]["paper_cites_paper"]
+    )
+    data["paper", "belongs_to", "journal"].edge_index = torch.tensor(
+        mappings["edges"]["paper_belongs_to_journal"]
+    )
+    data["paper", "written_by", "author"].edge_index = torch.tensor(
+        mappings["edges"]["paper_written_by_author"]
+    )
+    data["author", "coauthor", "author"].edge_index = torch.tensor(
+        mappings["edges"]["author_coauthor_author"]
+    )
+    data = T.ToUndirected()(data)
+
+    # Remove edge_label attributes from reverse edges (if they exist)
+    if hasattr(data["paper", "rev_cites", "paper"], "edge_label"):
+        del data["paper", "rev_cites", "paper"].edge_label
+    if hasattr(data["author", "rev_coauthor", "author"], "edge_label"):
+        del data["author", "rev_coauthor", "author"].edge_label
+
+    # Remove empty edge types (those without edge_index)
+    edge_types_to_remove = []
+    for edge_type in data.edge_types:
+        if not hasattr(data[edge_type], "edge_index") or data[edge_type].num_edges == 0:
+            edge_types_to_remove.append(edge_type)
+
+    for edge_type in edge_types_to_remove:
+        del data[edge_type]
+
+    data.validate(raise_on_error=True)
+
+    # Set seeds for reproducible data splitting
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+    train_data, val_data, test_data = T.RandomLinkSplit(
+        num_val=0.1,
+        num_test=0.2,
+        disjoint_train_ratio=0.3,  # 30% for supervision, 70% for message passing
+        neg_sampling_ratio=2,
+        add_negative_train_samples=False,
+        edge_types=[
+            ("paper", "cites", "paper"),
+            ("paper", "belongs_to", "journal"),
+            ("paper", "written_by", "author"),
+            ("author", "coauthor", "author"),
+        ],
+        rev_edge_types=[
+            ("journal", "rev_belongs_to", "paper"),
+            ("author", "rev_written_by", "paper"),
+            ("author", "rev_coauthor", "author"),
+            ("paper", "rev_cites", "paper"),
+        ],
+    )(data)
+
+    # Remove empty edge types from all data splits
+    for dataset in [train_data, val_data, test_data]:
+        edge_types_to_remove = []
+        for edge_type in dataset.edge_types:
+            if (
+                not hasattr(dataset[edge_type], "edge_index")
+                or dataset[edge_type].num_edges == 0
+            ):
+                edge_types_to_remove.append(edge_type)
+
+        for edge_type in edge_types_to_remove:
+            del dataset[edge_type]
+
+    return train_data, val_data, test_data, data, mappings
+
+
+def get_homogeneous_data(include_journal_idx=False, seed=42):
+    """Load data and create train/val/test splits with reproducible seed"""
+    mappings = load_processed_data()
+    num_papers = mappings["num_papers"]
+    pub_years = torch.tensor(
+        mappings["df"]["pubDate"].str.split(" ").str[0].astype(int).values
+    )
     x_tensor = torch.tensor(
         mappings["paper_embeddings"], dtype=torch.float, requires_grad=False
     )
@@ -303,21 +407,30 @@ def get_homogeneous_data(include_journal_idx=False):
         x_tensor = torch.cat(
             [x_tensor, journal_idx_tensor.unsqueeze(1).float()],
             dim=1,
-            requires_grad=False,
         )
-    data = Data(x=x_tensor)
+    data = Data(x=x_tensor, time=pub_years)
     data.edge_index = torch.tensor(
         mappings["edges"]["paper_cites_paper"], dtype=torch.long
     )
     data.num_nodes = num_papers
     data.validate(raise_on_error=True)
+
+    # Set seeds for reproducible data splitting
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
     transform = T.RandomLinkSplit(
-        num_val=0.2,
+        num_val=0.1,
         num_test=0.2,
-        disjoint_train_ratio=0.3,
+        is_undirected=False,
+        disjoint_train_ratio=0.3,  # 30% for supervision, 70% for message passing
         neg_sampling_ratio=2,
         add_negative_train_samples=False,
+        # edge_types=("paper", "cites", "paper"),
+        # rev_edge_types=("paper", "rev_cites", "paper"),
     )
+
     train_data, val_data, test_data = transform(data)
     return train_data, val_data, test_data, data, mappings
 

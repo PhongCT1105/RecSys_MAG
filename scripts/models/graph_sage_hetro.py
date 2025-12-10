@@ -1,7 +1,8 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import SAGEConv
+from torch_geometric.nn import SAGEConv, HeteroConv
+from torch_geometric.data import HeteroData
 from torch_geometric.utils import negative_sampling
 
 
@@ -14,6 +15,7 @@ class GraphSAGE(nn.Module):
         in_channels,
         hidden_channels,
         out_channels,
+        metadata,
         num_layers=2,
         dropout=0.5,
         aggregator="mean",
@@ -22,22 +24,32 @@ class GraphSAGE(nn.Module):
         super(GraphSAGE, self).__init__()
         self.num_layers = num_layers
         self.dropout = dropout
-        if journal_embeddings:
-            in_channels += JOURNAL_EMBEDDING_DIM - 1  # account for journal index
-            self.jounal_emb = nn.Embedding(2566, JOURNAL_EMBEDDING_DIM)
+
+        self.journal_emb = nn.Embedding(2566, in_channels)
+        self.author_emb = nn.Embedding(300059, in_channels)
+
+        # Build heterogeneous conv layers manually
         self.convs = nn.ModuleList()
-        self.bns = nn.ModuleList()
 
-        # First layer
-        self.convs.append(SAGEConv(in_channels, hidden_channels, aggr=aggregator))
-        self.bns.append(nn.BatchNorm1d(hidden_channels))
-
-        # Hidden layers
-        for _ in range(num_layers - 2):
-            self.convs.append(
-                SAGEConv(hidden_channels, hidden_channels, aggr=aggregator)
+        # First layer: in_channels -> hidden_channels
+        conv_dict = {}
+        for edge_type in metadata[1]:
+            src_type, _, dst_type = edge_type
+            conv_dict[edge_type] = SAGEConv(
+                (in_channels, in_channels), hidden_channels, aggr=aggregator
             )
-            self.bns.append(nn.BatchNorm1d(hidden_channels))
+        self.convs.append(HeteroConv(conv_dict, aggr="sum"))
+
+        # Additional layers if needed
+        if num_layers > 1:
+            # Last layer: hidden_channels -> out_channels
+            conv_dict = {}
+            for edge_type in metadata[1]:
+                src_type, _, dst_type = edge_type
+                conv_dict[edge_type] = SAGEConv(
+                    (hidden_channels, hidden_channels), out_channels, aggr=aggregator
+                )
+            self.convs.append(HeteroConv(conv_dict, aggr="sum"))
 
         self.decoder = nn.Sequential(
             nn.Linear(2 * out_channels, out_channels),
@@ -45,59 +57,73 @@ class GraphSAGE(nn.Module):
             nn.Linear(out_channels, 1),
         )
 
-        # Output layer
-        if num_layers > 1:
-            self.convs.append(SAGEConv(hidden_channels, out_channels, aggr=aggregator))
-        else:
-            self.convs[0] = SAGEConv(in_channels, out_channels, aggr=aggregator)
+    def forward(self, data: HeteroData):
+        x_dict = {
+            "paper": data["paper"].x,
+            "journal": self.journal_emb(data["journal"].node_id),
+            "author": self.author_emb(data["author"].node_id),
+        }
 
-    def forward(self, x, train_edge_index):
+        # Apply first layer
+        x_dict = self.convs[0](x_dict, data.edge_index_dict)
+        x_dict = {key: F.relu(x) for key, x in x_dict.items()}
+        x_dict = {
+            key: F.dropout(x, p=self.dropout, training=self.training)
+            for key, x in x_dict.items()
+        }
 
-        if hasattr(self, "jounal_emb"):  # add journal embeddings
-            journal_idx = x[:, -1].long()
-            x = x[:, :-1]
-            journal_emb = self.jounal_emb(journal_idx)
-            x = torch.cat([x, journal_emb], dim=-1)
-        for i in range(self.num_layers - 1):
-            x = self.convs[i](x, train_edge_index)
-            x = self.bns[i](x)
-            x = F.relu(x)
-            x = F.dropout(x, p=self.dropout, training=self.training)
+        # Apply second layer if exists
+        if self.num_layers > 1:
+            x_dict = self.convs[1](x_dict, data.edge_index_dict)
 
-        # Last layer without activation
-        x = self.convs[-1](x, train_edge_index)
+        return x_dict
 
-        return x
-
-    def encode(self, x, train_edge_index):
+    def encode(self, data):
         """Get node embeddings (same as forward)."""
-        return self.forward(x, train_edge_index)
+        return self.forward(data)
 
-    def decode(self, z, edge_label_index):
+    def decode(self, z_dict, edge_label_index, edge_type=("paper", "cites", "paper")):
         """
-        z: Node embeddings [num_nodes, out_channels]
+        z_dict: Dictionary of node embeddings for each node type
         edge_label_index: Edge indices to predict [2, num_edges]
+        edge_type: The edge type being predicted
         """
-        src = z[edge_label_index[0]]
-        dst = z[edge_label_index[1]]
+        # Get embeddings for the source and target node types
+        src_type = edge_type[0]
+        dst_type = edge_type[2]
+
+        z_src = z_dict[src_type]
+        z_dst = z_dict[dst_type]
+
+        src = z_src[edge_label_index[0]]
+        dst = z_dst[edge_label_index[1]]
 
         return self.decoder(torch.cat([src, dst], dim=-1)).view(-1)
 
-    def decode_dot(self, z, edge_label_index):
+    def decode_dot(
+        self, z_dict, edge_label_index, edge_type=("paper", "cites", "paper")
+    ):
         """
         Dot product decoder for BPR loss
-        z: Node embeddings [num_nodes, out_channels]
+        z_dict: Dictionary of node embeddings for each node type
         edge_label_index: Edge indices to predict [2, num_edges]
+        edge_type: The edge type being predicted
         """
-        src = z[edge_label_index[0]]
-        dst = z[edge_label_index[1]]
+        src_type = edge_type[0]
+        dst_type = edge_type[2]
+
+        z_src = z_dict[src_type]
+        z_dst = z_dict[dst_type]
+
+        src = z_src[edge_label_index[0]]
+        dst = z_dst[edge_label_index[1]]
 
         # Dot product between source and destination embeddings
         return (src * dst).sum(dim=-1)
 
 
 def train_epoch(model, train_loader, optimizer, device, criterion=None):
-    """train one epoch with minibatches"""
+    """train one epoch with minibatches for heterogeneous graphs"""
     model.train()
 
     if criterion is None:
@@ -109,25 +135,26 @@ def train_epoch(model, train_loader, optimizer, device, criterion=None):
     for batch in train_loader:
         batch = batch.to(device)
         optimizer.zero_grad()
-        # encode
-        z = model.encode(batch.x, batch.edge_index)
 
-        # decode link predictions
-        pred = model.decode(z, batch.edge_label_index)
+        # encode - pass the heterogeneous batch
+        z_dict = model.encode(batch)
+
+        # decode link predictions for paper-cites-paper edges
+        pred = model.decode(z_dict, batch["paper", "cites", "paper"].edge_label_index)
 
         # compute loss
-        loss = criterion(pred, batch.edge_label.float())
+        loss = criterion(pred, batch["paper", "cites", "paper"].edge_label.float())
         loss.backward()
         optimizer.step()
 
-        total_loss += loss.item() * batch.edge_label.size(0)
-        total_examples += batch.edge_label.size(0)
+        total_loss += loss.item() * batch["paper", "cites", "paper"].edge_label.size(0)
+        total_examples += batch["paper", "cites", "paper"].edge_label.size(0)
 
     return total_loss / total_examples
 
 
 def train_epoch_bpr(model, train_loader, optimizer, device):
-    """Train one epoch with BPR loss"""
+    """Train one epoch with BPR loss for heterogeneous graphs"""
     model.train()
 
     total_loss = 0
@@ -138,18 +165,21 @@ def train_epoch_bpr(model, train_loader, optimizer, device):
         optimizer.zero_grad()
 
         # Encode
-        z = model.encode(batch.x, batch.edge_index)
+        z_dict = model.encode(batch)
 
         # Separate positive and negative edges
-        pos_mask = batch.edge_label == 1
-        neg_mask = batch.edge_label == 0
+        edge_label = batch["paper", "cites", "paper"].edge_label
+        edge_label_index = batch["paper", "cites", "paper"].edge_label_index
 
-        pos_edge_index = batch.edge_label_index[:, pos_mask]
-        neg_edge_index = batch.edge_label_index[:, neg_mask]
+        pos_mask = edge_label == 1
+        neg_mask = edge_label == 0
+
+        pos_edge_index = edge_label_index[:, pos_mask]
+        neg_edge_index = edge_label_index[:, neg_mask]
 
         # Compute scores using dot product
-        pos_scores = model.decode_dot(z, pos_edge_index)
-        neg_scores = model.decode_dot(z, neg_edge_index)
+        pos_scores = model.decode_dot(z_dict, pos_edge_index)
+        neg_scores = model.decode_dot(z_dict, neg_edge_index)
 
         # BPR loss expects same number of pos and neg
         # If counts differ, sample or repeat to match
@@ -175,7 +205,7 @@ def train_epoch_bpr(model, train_loader, optimizer, device):
 
 @torch.no_grad()
 def evaluate_loader(model, loader, device):
-    """evaluate using minibatch loader"""
+    """evaluate using minibatch loader for heterogeneous graphs"""
     from sklearn.metrics import roc_auc_score
 
     model.eval()
@@ -186,12 +216,14 @@ def evaluate_loader(model, loader, device):
     for batch in loader:
         batch = batch.to(device)
         # encode
-        z = model.encode(batch.x, batch.edge_index)
+        z_dict = model.encode(batch)
 
         # decode
-        pred = model.decode(z, batch.edge_label_index).sigmoid()
+        pred = model.decode(
+            z_dict, batch["paper", "cites", "paper"].edge_label_index
+        ).sigmoid()
         all_preds.append(pred.cpu())
-        all_labels.append(batch.edge_label.cpu())
+        all_labels.append(batch["paper", "cites", "paper"].edge_label.cpu())
 
     preds = torch.cat(all_preds).numpy()
     labels = torch.cat(all_labels).numpy()
@@ -214,13 +246,19 @@ def evaluate_ranking_metrics(model, loader, device, k_values=[1, 5]):
     # collect all predictions
     for batch in loader:
         batch = batch.to(device)
-        z = model.encode(batch.x, batch.edge_index)
-        scores = model.decode(z, batch.edge_label_index).sigmoid()
+        z_dict = model.encode(batch)
+        scores = model.decode(
+            z_dict, batch["paper", "cites", "paper"].edge_label_index
+        ).sigmoid()
 
-        all_source_nodes.append(batch.edge_label_index[0].cpu())
-        all_target_nodes.append(batch.edge_label_index[1].cpu())
+        all_source_nodes.append(
+            batch["paper", "cites", "paper"].edge_label_index[0].cpu()
+        )
+        all_target_nodes.append(
+            batch["paper", "cites", "paper"].edge_label_index[1].cpu()
+        )
         all_scores.append(scores.cpu())
-        all_labels.append(batch.edge_label.cpu())
+        all_labels.append(batch["paper", "cites", "paper"].edge_label.cpu())
 
     source_nodes = torch.cat(all_source_nodes)
     target_nodes = torch.cat(all_target_nodes)

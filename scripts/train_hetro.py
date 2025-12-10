@@ -11,8 +11,8 @@ import numpy as np
 from torch.utils.data import DataLoader, TensorDataset
 
 sys.path.append(str(Path(__file__).parent))
-from load_data import load_processed_data, get_homogeneous_data
-from models.graph_sage import (
+from load_data import load_processed_data, get_hetrogeneous_data
+from models.graph_sage_hetro import (
     GraphSAGE,
     train_epoch,
     train_epoch_bpr,
@@ -87,8 +87,7 @@ def get_loaders(train_data, val_data, test_data, batch_size=128, seed=42):
     train_loader = LinkNeighborLoader(
         train_data,
         num_neighbors=[5, 2, 2],
-        edge_label=train_data.edge_label,
-        edge_label_index=train_data.edge_label_index,
+        edge_label_index=("paper", "cites", "paper"),
         batch_size=batch_size,
         shuffle=True,
         neg_sampling_ratio=1.0,
@@ -98,8 +97,11 @@ def get_loaders(train_data, val_data, test_data, batch_size=128, seed=42):
     val_loader = LinkNeighborLoader(
         data=train_data,
         num_neighbors=[5, 2, 2],
-        edge_label_index=val_data.edge_label_index,
-        edge_label=val_data.edge_label,
+        edge_label_index=(
+            ("paper", "cites", "paper"),
+            val_data["paper", "cites", "paper"].edge_label_index,
+        ),
+        edge_label=val_data["paper", "cites", "paper"].edge_label,
         batch_size=2 * batch_size,
         shuffle=False,
     )
@@ -107,8 +109,11 @@ def get_loaders(train_data, val_data, test_data, batch_size=128, seed=42):
     test_loader = LinkNeighborLoader(
         data=train_data,
         num_neighbors=[5, 2, 2],
-        edge_label_index=test_data.edge_label_index,
-        edge_label=test_data.edge_label,
+        edge_label_index=(
+            ("paper", "cites", "paper"),
+            test_data["paper", "cites", "paper"].edge_label_index,
+        ),
+        edge_label=test_data["paper", "cites", "paper"].edge_label,
         batch_size=2 * batch_size,
         shuffle=False,
     )
@@ -122,54 +127,10 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     print("loading dataset...")
-    train_data, val_data, test_data, data, mappings = get_homogeneous_data(
-        include_journal_idx=args.include_journal, seed=args.seed
+    train_data, val_data, test_data, data, mappings = get_hetrogeneous_data(
+        seed=args.seed
     )
-
-    train_edge_index = train_data["edge_index"]
-    train_dest = set(train_edge_index[1, :].tolist())
-
-    val_edge_index = val_data["edge_index"]
-    val_src = set(val_edge_index[0, :].tolist())
-
-    test_edge_index = test_data["edge_index"]
-    test_src = set(test_edge_index[0, :].tolist())
-
-    dest_nodes_to_remove = train_dest.intersection(val_src).union(
-        train_dest.intersection(test_src)
-    )
-    train_edge_index = train_data["edge_index"]
-    mask = ~torch.isin(
-        train_data["edge_index"][1, :], torch.tensor(list(dest_nodes_to_remove))
-    )
-    filtered_train_edge_index = train_edge_index[:, mask]
-    train_data["edge_index"] = filtered_train_edge_index
-
-    train_edge_index = train_data["edge_label_index"]
-    train_dest = set(train_edge_index[1, :].tolist())
-
-    val_edge_index = val_data["edge_label_index"]
-    val_src = set(val_edge_index[0, :].tolist())
-
-    test_edge_index = test_data["edge_label_index"]
-    test_src = set(test_edge_index[0, :].tolist())
-
-    dest_nodes_to_remove = train_dest.intersection(val_src).union(
-        train_dest.intersection(test_src)
-    )
-    train_edge_index = train_data["edge_label_index"]
-    mask = ~torch.isin(
-        train_data["edge_label_index"][1, :], torch.tensor(list(dest_nodes_to_remove))
-    )
-    filtered_train_edge_index = train_edge_index[:, mask]
-    train_data["edge_label_index"] = filtered_train_edge_index
-
-    if args.random_features:
-        print("using random features instead of specter2 embeddings")
-        data.x = torch.zeros_like(data.x)
-        train_data.x = data.x
-        val_data.x = data.x
-        test_data.x = data.x
+    print(train_data)
 
     train_loader, val_loader, test_loader = get_loaders(
         train_data, val_data, test_data, batch_size=256, seed=args.seed
@@ -177,9 +138,10 @@ def main():
 
     if args.model == "sage":
         model = GraphSAGE(
-            in_channels=data.num_features,
+            in_channels=data["paper"].num_features,
             hidden_channels=args.hidden_dim,
             out_channels=args.out_dim,
+            metadata=data.metadata(),
             num_layers=args.num_layers,
             dropout=args.dropout,
             aggregator=args.aggregator,
@@ -246,9 +208,6 @@ def main():
                         },
                         save_path,
                     )
-
-    test_auc = evaluate_loader(model, test_loader, device)
-    test_ranking = evaluate_ranking_metrics(model, test_loader, device, k_values=[1, 5])
     if args.save_model:
         save_path = Path(args.model_path.replace(".pt", "_final.pt"))
         save_path.parent.mkdir(parents=True, exist_ok=True)
@@ -259,6 +218,8 @@ def main():
             },
             save_path,
         )
+    test_auc = evaluate_loader(model, test_loader, device)
+    test_ranking = evaluate_ranking_metrics(model, test_loader, device, k_values=[1, 5])
 
     print(f"\ntraining complete!")
     print(f"best val auc: {best_val_auc:.4f} at epoch {best_epoch}")
